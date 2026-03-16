@@ -22,8 +22,9 @@ Powered by: pyannote.audio | pydub | numpy | torch
 #    1. Sign up at https://huggingface.co/join
 #    2. Go to https://huggingface.co/settings/tokens
 #    3. Click "New token" → select "Read" access → copy it
-#    4. Accept the model licence at:
+#    4. Accept BOTH model licences (required before first download):
 #       https://huggingface.co/pyannote/speaker-diarization-3.1
+#       https://huggingface.co/pyannote/segmentation-3.0
 #
 #  RECOMMENDED: Set it as an environment variable so it never
 #  appears in your source code:
@@ -41,7 +42,6 @@ HF_TOKEN_FALLBACK = ""   # e.g. "hf_xxxxxxxxxxxxxxxxxxxx"
 # --- Input audio file -----------------------------------------
 #
 #  Full path to the audio file you want to process.
-#
 #  Leave as None to auto-detect the first audio file on the Desktop.
 #
 #  Examples:
@@ -77,11 +77,13 @@ OUTPUT_FOLDER = None   # e.g. r"C:\Users\<USERNAME>\Desktop\output"
 #  providing these values improves accuracy significantly.
 #  Leave as None to let the model estimate automatically.
 #
+#  IMPORTANT: MIN_SPEAKERS must be <= MAX_SPEAKERS.
+#
 #  Example — exactly 2 speakers:
 #    MIN_SPEAKERS = 2
 #    MAX_SPEAKERS = 2
 #
-#  Example — 2 to 5 speakers, not sure exactly:
+#  Example — between 2 and 5 speakers:
 #    MIN_SPEAKERS = 2
 #    MAX_SPEAKERS = 5
 #
@@ -108,9 +110,17 @@ from pyannote.audio import Pipeline
 
 # ── Constants ──────────────────────────────────────────────────
 
-CHUNK_MS        = 5_000                     # audio padding chunk (ms)
-DEFAULT_DESKTOP = Path.home() / "Desktop"   # cross-platform Desktop path
+CHUNK_MS         = 5_000    # audio padding granularity (ms) for pyannote stability
+MIN_AUDIO_SECS   = 10       # warn if audio is shorter than this
 AUDIO_EXTENSIONS = (".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac", ".wma")
+
+def _default_output_dir() -> Path:
+    """
+    Return the Desktop path, falling back to the home directory if
+    the Desktop folder does not exist (common on headless Linux systems).
+    """
+    desktop = Path.home() / "Desktop"
+    return desktop if desktop.exists() else Path.home()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -120,7 +130,7 @@ AUDIO_EXTENSIONS = (".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac", ".wma")
 def check_ffmpeg() -> None:
     """
     Verify that ffmpeg is on the system PATH.
-    pydub cannot decode MP3/M4A/AAC without it.
+    pydub cannot decode MP3 / M4A / AAC without it.
     """
     if shutil.which("ffmpeg") is None:
         raise EnvironmentError(
@@ -134,23 +144,50 @@ def check_ffmpeg() -> None:
 
 def resolve_hf_token() -> str:
     """
-    Resolve the HuggingFace token in this order:
-      1. HF_TOKEN environment variable  (recommended)
-      2. HF_TOKEN_FALLBACK constant above (less secure)
-    Raises EnvironmentError if neither is set.
+    Resolve the HuggingFace token in priority order:
+      1. HF_TOKEN environment variable  (recommended — keeps token out of source)
+      2. HF_TOKEN_FALLBACK constant at the top of this file  (less secure)
+    Raises EnvironmentError with setup instructions if neither is set.
     """
     token = os.environ.get("HF_TOKEN", "").strip() or HF_TOKEN_FALLBACK.strip()
     if not token:
         raise EnvironmentError(
             "\nHuggingFace token not found.\n"
-            "Set it as an environment variable:\n"
+            "Option 1 — environment variable (recommended):\n"
             "  Windows PowerShell : $env:HF_TOKEN=\"hf_xxxxxxxxxxxx\"\n"
             "  Windows CMD        : set HF_TOKEN=hf_xxxxxxxxxxxx\n"
             "  macOS / Linux      : export HF_TOKEN=hf_xxxxxxxxxxxx\n"
-            "Or paste it into HF_TOKEN_FALLBACK at the top of this script.\n"
+            "Option 2 — paste into HF_TOKEN_FALLBACK at the top of this script.\n"
             "Get a free token at: https://huggingface.co/settings/tokens\n"
         )
     return token
+
+
+def validate_speaker_hints(
+    min_speakers: Optional[int],
+    max_speakers: Optional[int],
+) -> None:
+    """
+    Validate speaker count hints before passing them to pyannote.
+    Raises ValueError with a clear message on invalid input.
+    """
+    if min_speakers is not None and min_speakers < 1:
+        raise ValueError(
+            f"min_speakers must be >= 1, got {min_speakers}."
+        )
+    if max_speakers is not None and max_speakers < 1:
+        raise ValueError(
+            f"max_speakers must be >= 1, got {max_speakers}."
+        )
+    if (
+        min_speakers is not None
+        and max_speakers is not None
+        and min_speakers > max_speakers
+    ):
+        raise ValueError(
+            f"min_speakers ({min_speakers}) must be <= max_speakers ({max_speakers}).\n"
+            "Check MIN_SPEAKERS / MAX_SPEAKERS at the top of the script."
+        )
 
 
 # ══════════════════════════════════════════════════════════════
@@ -161,7 +198,7 @@ def clear_model_cache() -> bool:
     """
     Delete the local pyannote model cache to force a fresh download.
     Only call this if you suspect a corrupted download.
-    Not invoked automatically.
+    Not invoked automatically — uncomment the call below to use.
     """
     cache_dir = Path.home() / ".cache" / "torch" / "pyannote"
     if cache_dir.exists():
@@ -185,42 +222,56 @@ def clear_model_cache() -> bool:
 
 def load_pipeline(hf_token: str) -> Pipeline:
     """
-    Load pyannote speaker-diarization pipeline.
-    Tries v3.1 first; falls back to the base version if unavailable.
-    Moves automatically to GPU if CUDA is available.
+    Load the pyannote speaker-diarization pipeline.
+
+    Tries v3.1 first; falls back to the base version.
+    Uses the current `token=` parameter (pyannote >= 3.1) with automatic
+    fallback to the deprecated `use_auth_token=` for older installations.
+    Moves to GPU automatically if CUDA is available.
     """
     models_to_try = [
         "pyannote/speaker-diarization-3.1",
         "pyannote/speaker-diarization",
     ]
+
     pipeline = None
     for model_id in models_to_try:
-        try:
-            pipeline = Pipeline.from_pretrained(model_id, use_auth_token=hf_token)
-            print(f"  Loaded model : {model_id}")
+        # Try the current API first (pyannote >= 3.1), then the legacy parameter
+        for kwargs in ({"token": hf_token}, {"use_auth_token": hf_token}):
+            try:
+                pipeline = Pipeline.from_pretrained(model_id, **kwargs)
+                print(f"  Loaded model : {model_id}")
+                break
+            except TypeError:
+                # Wrong keyword for this version — try the other one
+                continue
+            except Exception as exc:
+                print(f"  Could not load {model_id}: {exc}")
+                break
+        if pipeline is not None:
             break
-        except Exception as exc:
-            print(f"  Could not load {model_id}: {exc}")
 
     if pipeline is None:
         raise RuntimeError(
             "\nFailed to load any pyannote pipeline. Common causes:\n"
             "  1. Token is invalid or expired\n"
-            "  2. Model licence not accepted at:\n"
+            "  2. Model licence not accepted — visit BOTH links and click 'Agree':\n"
             "     https://huggingface.co/pyannote/speaker-diarization-3.1\n"
-            "  3. No internet connection (required for first-time download)\n"
-            "  4. Outdated package — try: pip install --upgrade pyannote.audio\n"
+            "     https://huggingface.co/pyannote/segmentation-3.0\n"
+            "  3. No internet connection (required on first download, ~300 MB)\n"
+            "  4. Outdated package — run: pip install --upgrade pyannote.audio\n"
         )
 
+    # Move to GPU if available — CPU fallback is automatic
     try:
         import torch
         if torch.cuda.is_available():
             pipeline.to(torch.device("cuda"))
             print("  Device : GPU (CUDA)")
         else:
-            print("  Device : CPU (no CUDA found)")
+            print("  Device : CPU  (no CUDA found — GPU would be faster)")
     except ImportError:
-        print("  Device : CPU (torch import failed)")
+        print("  Device : CPU  (torch import failed)")
 
     return pipeline
 
@@ -231,11 +282,16 @@ def load_pipeline(hf_token: str) -> Pipeline:
 
 def prepare_audio(audio_path: Path, tmp_dir: str) -> Tuple[AudioSegment, Path]:
     """
-    Load audio, force mono, pad to a multiple of CHUNK_MS,
+    Load audio, convert to mono, pad to a multiple of CHUNK_MS,
     and write a temporary WAV to the system temp directory.
 
-    Using tempfile avoids permission issues on Desktop, network
-    drives, or read-only locations.
+    Why tempfile?  Writing to the system temp directory avoids permission
+    errors on Desktop paths, network drives, or read-only mounts.
+
+    Why mono?  pyannote requires single-channel input.
+
+    Why padding?  Padding to a CHUNK_MS multiple improves pyannote stability
+    on audio whose length is not a clean multiple of its internal chunk size.
 
     Returns:
         (AudioSegment of padded mono audio, Path to the temp WAV)
@@ -248,8 +304,19 @@ def prepare_audio(audio_path: Path, tmp_dir: str) -> Tuple[AudioSegment, Path]:
             f"Failed to load audio: {audio_path}\n"
             "Ensure ffmpeg is installed and the file is not corrupted.\n"
             f"Detail: {exc}"
+        ) from exc
+
+    # Warn if the recording is very short
+    duration_s = len(audio) / 1000.0
+    print(f"  Duration : {duration_s:.1f}s")
+    if duration_s < MIN_AUDIO_SECS:
+        print(
+            f"  Warning  : audio is only {duration_s:.1f}s. "
+            f"pyannote works best on recordings longer than {MIN_AUDIO_SECS}s. "
+            "Results may be inaccurate."
         )
 
+    # Pad so total length is a multiple of CHUNK_MS
     remainder = len(audio) % CHUNK_MS
     if remainder:
         padding_ms = CHUNK_MS - remainder
@@ -271,19 +338,25 @@ def calculate_loudness_metrics(segment: AudioSegment) -> Dict[str, float]:
     Compute RMS and peak amplitude for one audio segment.
 
     Handles:
-      - 8-bit, 16-bit, 32-bit PCM
+      - 8-bit, 16-bit, 32-bit signed PCM
       - Stereo → mono downmix before calculation
-      - Silent / zero-length segments (safe -100 dBFS defaults)
+      - Silent / zero-length segments (returns safe -100 dBFS defaults)
 
-    Returns:
-        rms, peak     — linear amplitude in [0, 1]
+    Returns a dict with keys:
+        rms, peak       — linear amplitude in [0.0, 1.0]
         rms_db, peak_db — same values in dBFS
     """
     samples = np.array(segment.get_array_of_samples(), dtype=np.float32)
 
-    bit_depth_divisors = {1: 128.0, 2: 32768.0, 4: 2147483648.0}
+    # Normalise to [-1.0, +1.0] based on PCM bit depth
+    bit_depth_divisors: Dict[int, float] = {
+        1: 128.0,           # 8-bit  signed
+        2: 32768.0,         # 16-bit signed
+        4: 2147483648.0,    # 32-bit signed
+    }
     samples /= bit_depth_divisors.get(segment.sample_width, 32768.0)
 
+    # Downmix stereo to mono by averaging channels
     if segment.channels == 2:
         samples = samples.reshape(-1, 2).mean(axis=1)
 
@@ -292,7 +365,7 @@ def calculate_loudness_metrics(segment: AudioSegment) -> Dict[str, float]:
 
     rms  = float(np.sqrt(np.mean(samples ** 2)))
     peak = float(np.max(np.abs(samples)))
-    eps  = 1e-10
+    eps  = 1e-10  # prevents log10(0) on completely silent frames
 
     return {
         "rms":     rms,
@@ -315,9 +388,9 @@ def run_diarization(
     """
     Run speaker diarization on the prepared mono WAV.
 
-    min_speakers / max_speakers are optional hints.
-    Providing them when you know the count improves accuracy.
-    If omitted, pyannote estimates the speaker count automatically.
+    min_speakers / max_speakers are optional hints to pyannote.
+    Providing them when you know the count significantly improves accuracy.
+    If both are None, pyannote estimates the count automatically.
     """
     kwargs: Dict = {}
     if min_speakers is not None:
@@ -325,8 +398,15 @@ def run_diarization(
     if max_speakers is not None:
         kwargs["max_speakers"] = max_speakers
 
-    hint = f"min={min_speakers}, max={max_speakers}" if kwargs else "auto-detect"
+    # Build readable hint — only show values that are actually set
+    hint_parts = []
+    if min_speakers is not None:
+        hint_parts.append(f"min={min_speakers}")
+    if max_speakers is not None:
+        hint_parts.append(f"max={max_speakers}")
+    hint = ", ".join(hint_parts) if hint_parts else "auto-detect"
     print(f"  Speaker count : {hint}")
+
     return pipeline(str(tmp_wav), **kwargs)
 
 
@@ -339,7 +419,7 @@ def collect_speaker_data(
     audio: AudioSegment,
 ) -> Tuple[Dict[str, float], Dict[str, List], Dict[str, List]]:
     """
-    Walk the diarization output and collect per-speaker data.
+    Walk diarization output and collect per-speaker data.
 
     Returns:
         speaker_times    — {speaker: total speaking seconds}
@@ -352,6 +432,11 @@ def collect_speaker_data(
 
     for turn, _, speaker in diarization_result.itertracks(yield_label=True):
         duration = turn.end - turn.start
+
+        # Skip zero-duration segments (edge case in some pyannote outputs)
+        if duration <= 0.0:
+            continue
+
         speaker_times[speaker] = speaker_times.get(speaker, 0.0) + duration
         speaker_segments.setdefault(speaker, []).append((turn.start, turn.end))
 
@@ -370,10 +455,10 @@ def compute_average_loudness(
     speaker_loudness: Dict[str, List]
 ) -> Dict[str, Dict[str, float]]:
     """
-    Duration-weighted average loudness per speaker.
+    Compute duration-weighted average loudness per speaker.
 
     Composite = 0.6 * avg_rms + 0.4 * avg_peak  (linear scale).
-    Averaging linear RMS (not dB) is physically correct for energy.
+    Averaging linear RMS (not dB) is physically correct for energy averaging.
     """
     result: Dict[str, Dict[str, float]] = {}
     for speaker, segs in speaker_loudness.items():
@@ -389,11 +474,11 @@ def compute_average_loudness(
         avg_peak_db = float(np.average([s["peak_db"] for s in segs], weights=w))
 
         result[speaker] = {
-            "avg_rms":   avg_rms,
-            "avg_peak":  avg_peak,
+            "avg_rms":     avg_rms,
+            "avg_peak":    avg_peak,
             "avg_rms_db":  avg_rms_db,
             "avg_peak_db": avg_peak_db,
-            "composite": 0.6 * avg_rms + 0.4 * avg_peak,
+            "composite":   0.6 * avg_rms + 0.4 * avg_peak,
         }
     return result
 
@@ -411,7 +496,7 @@ def export_speaker_audio(
 ) -> Optional[Path]:
     """
     Concatenate all diarized segments for one speaker and save as WAV.
-    Returns the saved path, or None if no audio was found.
+    Returns the saved Path, or None if no audio was found.
     """
     combined = AudioSegment.empty()
     for start_s, end_s in speaker_segments[speaker]:
@@ -421,7 +506,7 @@ def export_speaker_audio(
             combined += audio[start_ms:end_ms]
 
     if len(combined) == 0:
-        print(f"  Warning: no audio found for {speaker} — skipping.")
+        print(f"  Warning: no audio found for {speaker} — skipping export.")
         return None
 
     out_path = output_dir / f"{speaker.lower()}{suffix}.wav"
@@ -458,8 +543,11 @@ def write_report(
         fh.write("-" * 60 + "\n")
         fh.write(f"  Time-based dominant    : {time_dominant}\n")
         fh.write(f"  Loudness-based dominant: {loudness_dominant}\n")
-        fh.write(f"  Selected main speaker  : {main_speaker}"
-                 "  (time-based — most reliable)\n\n")
+        # Explicit concatenation — avoids ambiguous f-string boundary
+        fh.write(
+            f"  Selected main speaker  : {main_speaker}"
+            f"  (time-based — most reliable)\n\n"
+        )
 
         fh.write("-" * 60 + "\n")
         fh.write("SPEAKER STATISTICS\n")
@@ -503,37 +591,46 @@ def write_report(
 
 def main() -> None:
 
-    # ── CLI arguments (override the constants at the top) ──
+    # ── CLI arguments (always override the constants at the top) ──
     parser = argparse.ArgumentParser(
         description="Separate speakers from a multi-speaker audio file.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Command-line examples (these override the constants at the top of the script):
+Command-line examples (always override the constants at the top of the script):
 
   python diarization.py
       Uses INPUT_AUDIO_FILE and OUTPUT_FOLDER from the top of the script.
-      If both are None, auto-detects audio on Desktop and outputs there.
+      If both are None, auto-detects the first audio file on the Desktop
+      and saves output there.
 
   python diarization.py --input audio.mp3
   python diarization.py --input audio.mp3 --output ./results
   python diarization.py --input audio.mp3 --min-speakers 2 --max-speakers 4
         """
     )
-    parser.add_argument("--input",  "-i", default=None,
-                        help="Path to input audio file. Overrides INPUT_AUDIO_FILE.")
-    parser.add_argument("--output", "-o", default=None,
-                        help="Path to output folder. Overrides OUTPUT_FOLDER.")
-    parser.add_argument("--min-speakers", type=int, default=None, metavar="N",
-                        help="Minimum expected speakers. Overrides MIN_SPEAKERS.")
-    parser.add_argument("--max-speakers", type=int, default=None, metavar="N",
-                        help="Maximum expected speakers. Overrides MAX_SPEAKERS.")
+    parser.add_argument(
+        "--input", "-i", default=None,
+        help="Path to input audio file. Overrides INPUT_AUDIO_FILE.",
+    )
+    parser.add_argument(
+        "--output", "-o", default=None,
+        help="Path to output folder. Overrides OUTPUT_FOLDER.",
+    )
+    parser.add_argument(
+        "--min-speakers", type=int, default=None, metavar="N",
+        help="Minimum expected speakers (optional hint). Overrides MIN_SPEAKERS.",
+    )
+    parser.add_argument(
+        "--max-speakers", type=int, default=None, metavar="N",
+        help="Maximum expected speakers (optional hint). Overrides MAX_SPEAKERS.",
+    )
     args = parser.parse_args()
 
-    # CLI args take priority over the constants defined at the top
+    # CLI args take priority over the constants at the top of the file
     input_file   = args.input        or INPUT_AUDIO_FILE
     output_dir_s = args.output       or OUTPUT_FOLDER
-    min_spk      = args.min_speakers if args.min_speakers is not None else MIN_SPEAKERS
-    max_spk      = args.max_speakers if args.max_speakers is not None else MAX_SPEAKERS
+    min_spk: Optional[int] = args.min_speakers if args.min_speakers is not None else MIN_SPEAKERS
+    max_spk: Optional[int] = args.max_speakers if args.max_speakers is not None else MAX_SPEAKERS
 
     print("\n==============================================")
     print("   Speaker Diarization")
@@ -543,8 +640,10 @@ Command-line examples (these override the constants at the top of the script):
     print("[1/6] Preflight checks")
     check_ffmpeg()
     hf_token = resolve_hf_token()
-    print("  ffmpeg   : OK")
-    print("  HF token : OK")
+    validate_speaker_hints(min_spk, max_spk)
+    print("  ffmpeg          : OK")
+    print("  HF token        : OK")
+    print("  Speaker hints   : OK")
 
     # ── Step 2: Resolve paths ─────────────────────────────
     print("\n[2/6] Resolving paths")
@@ -554,30 +653,44 @@ Command-line examples (these override the constants at the top of the script):
         if not audio_path.exists():
             raise FileNotFoundError(
                 f"Input file not found: {audio_path}\n"
-                "Check the INPUT_AUDIO_FILE path at the top of the script."
+                "Check the INPUT_AUDIO_FILE path at the top of the script,\n"
+                "or pass: --input path/to/your/audio.mp3"
             )
         if not audio_path.is_file():
-            raise ValueError(f"Input path is not a file: {audio_path}")
+            raise ValueError(
+                f"Input path is a directory, not a file: {audio_path}\n"
+                "Provide the full path including the filename and extension."
+            )
     else:
-        # Auto-detect first audio file on Desktop
+        # Auto-detect the first audio file on the Desktop
+        desktop = Path.home() / "Desktop"
+        if not desktop.exists():
+            raise FileNotFoundError(
+                f"Desktop folder not found ({desktop}).\n"
+                "Set INPUT_AUDIO_FILE at the top of the script, or run:\n"
+                "  python diarization.py --input path/to/audio.mp3"
+            )
         candidates = sorted(
-            f for f in DEFAULT_DESKTOP.iterdir()
+            f for f in desktop.iterdir()
             if f.is_file() and f.suffix.lower() in AUDIO_EXTENSIONS
         )
         if not candidates:
             raise FileNotFoundError(
-                f"No audio file found on Desktop ({DEFAULT_DESKTOP}).\n"
+                f"No audio file found on Desktop ({desktop}).\n"
                 "Either:\n"
                 "  1. Place an audio file on the Desktop, or\n"
                 "  2. Set INPUT_AUDIO_FILE at the top of this script, or\n"
                 "  3. Run:  python diarization.py --input path/to/audio.mp3"
             )
         audio_path = candidates[0]
-        print(f"  Auto-detected input : {audio_path.name}")
+        print(f"  Auto-detected : {audio_path.name}")
 
-    output_dir = Path(str(output_dir_s)).expanduser().resolve() \
-                 if output_dir_s else DEFAULT_DESKTOP
-    output_dir.mkdir(parents=True, exist_ok=True)  # create folder if needed
+    # Resolve output directory — create it if it does not exist
+    if output_dir_s:
+        output_dir = Path(str(output_dir_s)).expanduser().resolve()
+    else:
+        output_dir = _default_output_dir()
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"  Input  : {audio_path}")
     print(f"  Output : {output_dir}")
@@ -588,14 +701,18 @@ Command-line examples (these override the constants at the top of the script):
 
     # ── Step 4: Prepare audio ─────────────────────────────
     print("\n[4/6] Preparing audio")
-    # tempfile is always writable; temp files are auto-deleted on exit
+    # tempfile.TemporaryDirectory() is always writable and auto-deleted on exit,
+    # regardless of where the input file or output folder are located.
     with tempfile.TemporaryDirectory() as tmp_dir:
         audio, tmp_wav = prepare_audio(audio_path, tmp_dir)
 
         # ── Step 5: Diarise ───────────────────────────────
         print("\n[5/6] Running diarization")
         diarization_result = run_diarization(pipeline, tmp_wav, min_spk, max_spk)
-    # tmp_dir and tmp_wav are automatically deleted here
+
+    # tmp_dir and tmp_wav are automatically deleted after this point.
+    # diarization_result is a pyannote Annotation object held fully in memory —
+    # it does not depend on the tmp file after this point.
 
     # ── Step 6: Analyse ───────────────────────────────────
     print("\n[6/6] Analysing results")
@@ -605,21 +722,26 @@ Command-line examples (these override the constants at the top of the script):
     )
 
     if not speaker_times:
-        print("\nNo speakers detected.")
-        print("The audio may be silent, too short, or heavily degraded.")
+        print(
+            "\nNo speakers detected.\n"
+            "The audio may be silent, too short, or too degraded.\n"
+            "Try converting to a clean 16-bit mono WAV:\n"
+            "  ffmpeg -i input.mp3 -ar 16000 -ac 1 -sample_fmt s16 converted.wav"
+        )
         sys.exit(0)
 
     avg_loudness = compute_average_loudness(speaker_loudness_raw)
 
-    # Speaking time = primary and most reliable signal for main speaker
-    time_dominant = max(speaker_times, key=speaker_times.get)   # type: ignore[arg-type]
+    # Speaking time = primary, most reliable signal for identifying the main speaker.
+    # Loudness is computed and reported as supplementary information only.
+    time_dominant = max(speaker_times, key=speaker_times.get)    # type: ignore[arg-type]
     loudness_dominant = (
         max(avg_loudness, key=lambda s: avg_loudness[s]["composite"])
         if avg_loudness else time_dominant
     )
     main_speaker = time_dominant
 
-    # ── Console output ────────────────────────────────────
+    # ── Console: timeline ─────────────────────────────────
     print("\n=== SEGMENT TIMELINE ===")
     print(f"  {'Start':>8}  {'End':>8}  {'Speaker':<22}  {'Dur':>6}  {'RMS(dBFS)':>10}")
     print("  " + "-" * 64)
@@ -631,19 +753,21 @@ Command-line examples (these override the constants at the top of the script):
         rms_db   = -100.0
         if start_ms < len(audio) and end_ms > start_ms:
             rms_db = calculate_loudness_metrics(audio[start_ms:end_ms])["rms_db"]
+        dur = turn.end - turn.start
         timeline.append({
             "start":    turn.start,
             "end":      turn.end,
             "speaker":  speaker,
-            "duration": turn.end - turn.start,
+            "duration": dur,
             "rms_db":   rms_db,
         })
         print(
             f"  {turn.start:8.2f}  {turn.end:8.2f}  {speaker:<22}  "
-            f"{turn.end - turn.start:6.2f}  {rms_db:10.1f}"
+            f"{dur:6.2f}  {rms_db:10.1f}"
         )
     timeline.sort(key=lambda x: x["start"])
 
+    # ── Console: statistics ───────────────────────────────
     total_audio_s = len(audio) / 1000.0
     print("\n=== SPEAKER STATISTICS ===")
     for speaker, t in sorted(speaker_times.items()):
@@ -671,15 +795,19 @@ Command-line examples (these override the constants at the top of the script):
     print(f"\n  Main speaker : {main_speaker}")
 
     # ── Export audio ──────────────────────────────────────
-    print(f"\n=== EXPORTING AUDIO -> {output_dir} ===")
+    print(f"\n=== EXPORTING AUDIO  →  {output_dir} ===")
 
+    # Export main speaker labelled as _MAIN
     main_out = export_speaker_audio(
         main_speaker, speaker_segments, audio, output_dir, suffix="_MAIN"
     )
     if main_out:
-        print(f"  {main_speaker} (main) -> {main_out.name}")
+        print(f"  {main_speaker} (main)  →  {main_out.name}")
 
+    # Export all speakers as _only, skipping main (already exported as _MAIN)
     for speaker in sorted(speaker_segments):
+        if speaker == main_speaker:
+            continue   # avoid exporting the same audio twice under different names
         out = export_speaker_audio(
             speaker, speaker_segments, audio, output_dir, suffix="_only"
         )
@@ -688,7 +816,7 @@ Command-line examples (these override the constants at the top of the script):
                 f"  (composite: {avg_loudness[speaker]['composite']:.4f})"
                 if speaker in avg_loudness else ""
             )
-            print(f"  {speaker} -> {out.name}{loud}")
+            print(f"  {speaker}  →  {out.name}{loud}")
 
     # ── Write report ──────────────────────────────────────
     report_path = output_dir / f"{audio_path.stem}_diarization_report.txt"
@@ -697,7 +825,7 @@ Command-line examples (these override the constants at the top of the script):
         speaker_times, avg_loudness,
         time_dominant, loudness_dominant, main_speaker, timeline,
     )
-    print(f"\n  Report -> {report_path.name}")
+    print(f"\n  Report  →  {report_path.name}")
 
     print("\n==============================================")
     print("   DONE")
